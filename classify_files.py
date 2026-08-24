@@ -34,6 +34,7 @@ import re
 import shutil
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -127,7 +128,7 @@ def call_deepseek(user_prompt):
 
 
 def parse_json_response(text):
-    """从模型输出里提取 JSON（容忍代码块包裹及周边多余文字）。"""
+    """从模型输出里提取 JSON（容忍代码块包裹、全角标点及周边多余文字）。"""
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
@@ -137,7 +138,37 @@ def parse_json_response(text):
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
         text = text[start:end + 1]
-    return json.loads(text)
+    # 模型常输出全角标点（尤其中文提示词下），先归一化再解析
+    text = text.replace("：", ":").replace("，", ",")
+    # 修复模型把扩展名放到引号外的情况：{"名字".mp4:"目录"} -> {"名字.mp4":"目录"}
+    text = re.sub(r'("[^"]*")\.([A-Za-z0-9]{1,8})(\s*:)', lambda m: m.group(1)[:-1] + "." + m.group(2) + '"' + m.group(3), text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # 兜底：把全角引号当半角引号再试一次（可能改变字符串内容，仅作最后手段）
+        return json.loads(text.replace("“", '"').replace("”", '"'))
+
+
+def resolve_category(mapping, fname):
+    """从 AI 返回的映射里查文件名对应的目录，容忍键与文件名不完全一致。"""
+    c = mapping.get(fname)
+    if c:
+        return c
+    # 去掉文件名里常见的全角引号后比较，再比较去掉扩展名的主体，最后用包含关系兜底
+    def norm(s):
+        return re.sub(r"[“”‘’]", "", s)
+    nf = norm(fname)
+    for k, v in mapping.items():
+        if not isinstance(k, str):
+            continue
+        nk = norm(k)
+        if nk == nf:
+            return v
+        if os.path.splitext(nk)[0] == os.path.splitext(nf)[0]:
+            return v
+        if nk in nf or nf in nk:
+            return v
+    return ""
 
 
 def sanitize_rel_path(rel):
@@ -269,11 +300,26 @@ def main():
             "请返回 JSON 对象，把每个文件映射到一级目录名。"
         )
 
-        try:
-            content = call_deepseek(user_prompt)
-            mapping = parse_json_response(content)
-        except (urllib.error.URLError, json.JSONDecodeError, KeyError, IndexError) as e:
-            print(f"AI 调用失败，本批 {len(batch)} 个文件保持不动：{e}", file=sys.stderr)
+        mapping = None
+        last_err = None
+        last_raw = None
+        for attempt in range(1, 4):
+            try:
+                content = call_deepseek(user_prompt)
+                last_raw = content
+                mapping = parse_json_response(content)
+                break
+            except (urllib.error.URLError, json.JSONDecodeError, KeyError, IndexError) as e:
+                last_err = e
+                if attempt < 3:
+                    time.sleep(2 * attempt)
+        if mapping is None:
+            print(
+                f"AI 调用失败（已重试 3 次），本批 {len(batch)} 个文件保持不动：{last_err}",
+                file=sys.stderr,
+            )
+            if isinstance(last_err, json.JSONDecodeError) and last_raw:
+                print(f"模型原始输出：\n{last_raw!r}", file=sys.stderr)
             unmoved.extend(batch)
             continue
 
@@ -283,7 +329,7 @@ def main():
             continue
 
         for fname in batch:
-            rel = sanitize_rel_path(mapping.get(fname, "")) or OTHER_DIR
+            rel = sanitize_rel_path(resolve_category(mapping, fname)) or OTHER_DIR
             dest_dir = os.path.join(source_dir, *rel.split("/"))
             dest = unique_dest(dest_dir, fname)
             dest_dirs.add(dest_dir)
