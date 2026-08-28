@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-自动对目录内文件用 AI（DeepSeek）分类，缺目录自动创建，分类目录固定为一级。
+自动对目录内文件用 AI（DeepSeek）分类，缺目录自动创建，分类目录最多两级。
 
 用法：
     python3 classify_files.py [目录] [--dry-run]    # 分类
@@ -11,9 +11,10 @@
 流程：
     1. 扫描目录顶层文件，跳过目录、隐藏文件、下载中的临时文件（.crdownload 等）。
     2. 读出「已有目录」，连同文件名清单批量发给 DeepSeek，
-       返回「文件名 -> 一级目录名」映射。把已有目录写进提示词，是为了让 AI
-       优先复用现有目录，避免目录无限增长。
+       返回「文件名 -> 目录名」映射（一级，或 一级/二级）。把已有目录写进提示词，
+       是为了让 AI 优先复用现有目录，避免目录无限增长。
     3. 按映射 mkdir -p 建缺失目录并移动文件；识别不出或失败的兜底移入 other/。
+       文件名有固定前缀、属于同一专辑/艺术家/剧集时，归入 一级/二级 子目录。
     4. 同名冲突自动重命名（file (1).ext）。
     5. --rollback：把子目录里的文件全部移回顶层，并删除子目录，用于重新分类。
 
@@ -59,17 +60,24 @@ OTHER_DIR = os.environ.get("OTHER_DIR", "other")
 IN_PROGRESS_SUFFIXES = (".crdownload", ".part", ".download", ".tmp", ".partial")
 
 SYSTEM_PROMPT = (
-    "你是一个文件整理助手。根据文件名和后缀，把每个文件归入一个一级目录。"
-    "目录固定为一级：只能返回一个目录名，路径中不要出现 /。"
-    "当文件名能明确识别出内容主题时，用主题名作为目录，例如 文学、小说、技术文档、"
+    "你是一个文件整理助手。根据文件名和后缀，把每个文件归入一个目录。"
+    "第一级是分类目录，例如 音乐、影视、文档、图片 等。"
+    "当同一批里有多个文件名共享明显前缀、明显属于同一个专辑 / 艺术家 / 剧集时，"
+    "把它们归入一个二级子目录，目录名取该专辑 / 艺术家 / 剧集名，"
+    "返回形式为「一级/二级」，例如 音乐/十二月的肖邦、影视/琅琊榜。"
+    "孤立文件（无法与其他文件成组）只归入一级目录，"
+    "禁止为单个文件单独建目录（无论一级还是二级）。"
+    "路径最多两级，禁止出现第三级。"
+    "当文件名能明确识别出内容主题时，用主题名作为一级目录，例如 文学、小说、技术文档、"
     "技术数据、美食、哲学、足控、游戏、旅行 等；"
     "其中 小说 指虚构故事，文学 指散文/诗歌等非小说文学，技术文档 指手册/说明/规范，"
     "技术数据 指数据表/数据集/日志。"
     "否则按文件类型归类，例如 音频、视频、文档、图片、字体、压缩包。"
-    "同类文件归同一个目录，禁止为单个文件单独建目录。"
-    "优先复用「现有目录」里已有的目录；确属新类别时才新建一个一级目录。"
+    "同类文件归同一个目录。"
+    "优先复用「现有目录」里已有的目录；确属新类别时才新建一个目录。"
     "无法判断的，统一归入 other。"
-    "只输出一个 JSON 对象，键为完整文件名，值为单层目录名，不要输出任何解释或多余文字。"
+    "只输出一个 JSON 对象，键为完整文件名，值为目录（一级，或 一级/二级），"
+    "不要输出任何解释或多余文字。"
 )
 
 
@@ -89,14 +97,20 @@ def list_files(source_dir):
 
 
 def list_directory_tree(source_dir):
-    """列出顶层目录名（固定一级，不再递归），用于喂给 AI 复用。"""
-    tree = sorted(
-        d for d in os.listdir(source_dir)
-        if os.path.isdir(os.path.join(source_dir, d)) and not d.startswith(".")
-    )
-    if len(tree) > TREE_LIMIT:
-        tree = tree[:TREE_LIMIT] + [f"...（其余 {len(tree) - TREE_LIMIT} 个目录省略）"]
-    return tree
+    """列出已有目录（两级：一级分类，及一级下的二级子目录），用于喂给 AI 复用。"""
+    entries = []
+    for d in sorted(os.listdir(source_dir)):
+        full = os.path.join(source_dir, d)
+        if not os.path.isdir(full) or d.startswith("."):
+            continue
+        entries.append(d)
+        for sub in sorted(os.listdir(full)):
+            subfull = os.path.join(full, sub)
+            if os.path.isdir(subfull) and not sub.startswith("."):
+                entries.append(f"{d}/{sub}")
+    if len(entries) > TREE_LIMIT:
+        entries = entries[:TREE_LIMIT] + [f"...（其余 {len(entries) - TREE_LIMIT} 个目录省略）"]
+    return entries
 
 
 def call_deepseek(user_prompt):
@@ -172,15 +186,20 @@ def resolve_category(mapping, fname):
 
 
 def sanitize_rel_path(rel):
-    """清洗 AI 返回的路径并固定为一级目录；非法时返回空字符串。"""
+    """清洗 AI 返回的路径并固定为最多两级目录；非法时返回空字符串。"""
     if not isinstance(rel, str):
         return ""
     rel = rel.replace("\\", "/").strip().strip("/")
-    # 固定一层：只取第一级目录名
-    first = rel.split("/", 1)[0].strip()
-    if first in ("", ".", ".."):
-        return ""  # 拒绝空、"."、".."，防止逃逸出目标目录
-    return first
+    # 逐段切分，去掉空段，最多保留前两段
+    parts = [p.strip() for p in rel.split("/") if p.strip()][:2]
+    clean = []
+    for p in parts:
+        if p in (".", ".."):
+            return ""  # 拒绝 "."、".."，防止逃逸出目标目录
+        clean.append(p)
+    if not clean:
+        return ""
+    return "/".join(clean)
 
 
 def unique_dest(dest_dir, filename):
@@ -297,7 +316,7 @@ def main():
         user_prompt = (
             f"现有目录（优先复用，勿随意新建）：\n{tree_text}\n\n"
             f"待分类文件（共 {len(batch)} 个）：\n" + "\n".join(batch) + "\n\n"
-            "请返回 JSON 对象，把每个文件映射到一级目录名。"
+            "请返回 JSON 对象，把每个文件映射到目录（一级，或 一级/二级）。"
         )
 
         mapping = None
