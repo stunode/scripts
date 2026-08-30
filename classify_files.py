@@ -13,8 +13,9 @@
     2. 读出「已有目录」，连同文件名清单批量发给 DeepSeek，
        返回「文件名 -> 目录名」映射（一级，或 一级/二级）。把已有目录写进提示词，
        是为了让 AI 优先复用现有目录，避免目录无限增长。
-    3. 按映射 mkdir -p 建缺失目录并移动文件；识别不出或失败的兜底移入 other/。
-       文件名有固定前缀、属于同一专辑/艺术家/剧集时，归入 一级/二级 子目录。
+    3. 先按扩展名（音频/视频/图片/文档等）与共享「前缀 + 序号」做确定性归类，
+       其余交给 AI；AI 识别不出或失败的兜底移入 other/。文件名有固定前缀、
+       属于同一专辑/艺术家/剧集时，归入 一级/二级 子目录。
     4. 同名冲突自动重命名（file (1).ext）。
     5. --rollback：把子目录里的文件全部移回顶层，并删除子目录，用于重新分类。
 
@@ -29,6 +30,7 @@
 """
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -59,6 +61,37 @@ OTHER_DIR = os.environ.get("OTHER_DIR", "other")
 # 下载中的临时文件后缀，跳过不处理
 IN_PROGRESS_SUFFIXES = (".crdownload", ".part", ".download", ".tmp", ".partial")
 
+# 扩展名 -> 一级目录：确定性归类，避免 AI 把 .flac 之类误判进 other
+EXTENSION_CATEGORY = {
+    # 音频
+    ".flac": "音乐", ".mp3": "音乐", ".wav": "音乐", ".m4a": "音乐",
+    ".aac": "音乐", ".ogg": "音乐", ".opus": "音乐", ".wma": "音乐",
+    ".ape": "音乐", ".alac": "音乐", ".aiff": "音乐",
+    # 视频
+    ".mp4": "影视", ".mkv": "影视", ".avi": "影视", ".mov": "影视",
+    ".wmv": "影视", ".flv": "影视", ".webm": "影视", ".ts": "影视",
+    ".rmvb": "影视", ".m4v": "影视", ".3gp": "影视",
+    # 图片
+    ".jpg": "图片", ".jpeg": "图片", ".png": "图片", ".gif": "图片",
+    ".webp": "图片", ".bmp": "图片", ".svg": "图片", ".heic": "图片",
+    ".tiff": "图片", ".ico": "图片",
+    # 文档
+    ".pdf": "文档", ".doc": "文档", ".docx": "文档", ".xls": "文档",
+    ".xlsx": "文档", ".ppt": "文档", ".pptx": "文档", ".txt": "文档",
+    ".md": "文档", ".epub": "文档", ".mobi": "文档", ".csv": "文档",
+    ".rtf": "文档", ".pages": "文档",
+    # 压缩包
+    ".zip": "压缩包", ".rar": "压缩包", ".7z": "压缩包", ".tar": "压缩包",
+    ".gz": "压缩包", ".bz2": "压缩包", ".xz": "压缩包", ".tgz": "压缩包",
+    # 字体
+    ".ttf": "字体", ".otf": "字体", ".woff": "字体", ".woff2": "字体",
+    # 字幕
+    ".srt": "字幕", ".ass": "字幕", ".vtt": "字幕", ".sub": "字幕",
+    # 安装包
+    ".dmg": "安装包", ".exe": "安装包", ".msi": "安装包", ".apk": "安装包",
+    ".pkg": "安装包", ".deb": "安装包", ".rpm": "安装包",
+}
+
 SYSTEM_PROMPT = (
     "你是一个文件整理助手。根据文件名和后缀，把每个文件归入一个目录。"
     "第一级是分类目录，例如 音乐、影视、文档、图片 等。"
@@ -70,7 +103,7 @@ SYSTEM_PROMPT = (
     "必须归入「一级/前缀」二级目录。即使前缀读起来像一句描述也要成组，"
     "例如「beatyoursoul喜欢的音乐」是歌单名，应归入 音乐/beatyoursoul喜欢的音乐，"
     "而不是散落到 音乐/。"
-    "共享前缀但无序号时，只要前缀不是通用类别词（如 音乐、视频、图片），同样成组。"
+    "共享前缀但无序号时，只要前缀不是通用类别词（如 音乐、影视、图片），同样成组。"
     "只有真正孤立、与其他文件毫无共同前缀的文件，才只归入一级目录。"
     "禁止为单个文件单独建目录（无论一级还是二级）。"
     "路径最多两级，禁止出现第三级。"
@@ -78,7 +111,7 @@ SYSTEM_PROMPT = (
     "技术数据、美食、哲学、足控、游戏、旅行 等；"
     "其中 小说 指虚构故事，文学 指散文/诗歌等非小说文学，技术文档 指手册/说明/规范，"
     "技术数据 指数据表/数据集/日志。"
-    "否则按文件类型归类，例如 音频、视频、文档、图片、字体、压缩包。"
+    "否则按文件类型归类，例如 音乐、影视、文档、图片、字体、压缩包。"
     "同类文件归同一个目录。"
     "优先复用「现有目录」里已有的目录；确属新类别时才新建一个目录。"
     "无法判断的，统一归入 other。"
@@ -117,6 +150,34 @@ def list_directory_tree(source_dir):
     if len(entries) > TREE_LIMIT:
         entries = entries[:TREE_LIMIT] + [f"...（其余 {len(entries) - TREE_LIMIT} 个目录省略）"]
     return entries
+
+
+# 检测「前缀 + 序号 + 标题」命名，如「歌单名 - 86 - 歌名」。
+_PREFIX_SEQ_RE = re.compile(
+    r"^(?P<prefix>.+?)[\s\-_.]+(?P<num>\d{1,4})(?:[\s\-_.].*)?$"
+)
+
+
+def group_by_prefix(files):
+    """找出共享「前缀 + 序号」模式的文件，返回 {文件名: 前缀}（前缀被 >=2 个文件共享才收录）。
+
+    用于把同一歌单 / 专辑 / 剧集的散文件强制归入「一级/前缀」二级目录，
+    不依赖 AI 是否识别出成组。
+    """
+    prefix_count = {}
+    file_prefix = {}
+    for f in files:
+        stem = os.path.splitext(f)[0]
+        m = _PREFIX_SEQ_RE.match(stem)
+        if not m:
+            continue
+        prefix = m.group("prefix").strip(" .-_")
+        # 前缀至少 3 个字符，且不能是纯数字（避免把「2024-...」当年份前缀误分组）
+        if len(prefix) < 3 or prefix.isdigit():
+            continue
+        prefix_count[prefix] = prefix_count.get(prefix, 0) + 1
+        file_prefix[f] = prefix
+    return {f: p for f, p in file_prefix.items() if prefix_count[p] >= 2}
 
 
 def call_deepseek(user_prompt):
@@ -410,6 +471,8 @@ def main():
     dest_dirs = set()
     unmoved = []
 
+    prefix_of = group_by_prefix(files)
+
     for i in range(0, len(files), BATCH_SIZE):
         batch = files[i:i + BATCH_SIZE]
         user_prompt = (
@@ -427,7 +490,13 @@ def main():
                 last_raw = content
                 mapping = parse_json_response(content, batch)
                 break
-            except (urllib.error.URLError, json.JSONDecodeError, KeyError, IndexError) as e:
+            except (
+                urllib.error.URLError,
+                http.client.HTTPException,  # IncompleteRead / BadStatusLine 等连接中断
+                ValueError,  # 分块响应被截断时 _read_next_chunk_size 抛出的 ValueError
+                KeyError,
+                IndexError,
+            ) as e:
                 last_err = e
                 if attempt < 3:
                     time.sleep(2 * attempt)
@@ -448,6 +517,17 @@ def main():
 
         for fname in batch:
             rel = sanitize_rel_path(resolve_category(mapping, fname)) or OTHER_DIR
+
+            # 扩展名兜底：AI 误判成 other 或漏判时，用后缀纠正一级目录（如 .flac -> 音乐）
+            ext_cat = EXTENSION_CATEGORY.get(os.path.splitext(fname)[1].lower(), "")
+            if (not rel or rel == OTHER_DIR) and ext_cat:
+                rel = ext_cat
+
+            # 共享前缀分组：同一「前缀 + 序号」系列、且 AI 未给出二级时，强制归入 一级/前缀
+            pfx = prefix_of.get(fname)
+            if pfx and "/" not in rel and rel != OTHER_DIR:
+                rel = f"{rel}/{pfx}"
+
             dest_dir = os.path.join(source_dir, *rel.split("/"))
             dest = unique_dest(dest_dir, fname)
             dest_dirs.add(dest_dir)
