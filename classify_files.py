@@ -141,26 +141,119 @@ def call_deepseek(user_prompt):
     return ""
 
 
-def parse_json_response(text):
-    """从模型输出里提取 JSON（容忍代码块包裹、全角标点及周边多余文字）。"""
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    # 若周围有额外文字，截取第一个 { 到最后一个 }
-    start = text.find("{")
-    end = text.rfind("}")
+def _try_strict_json(text):
+    """按标准 JSON 解析，仅当结果是 dict 时返回；失败或非 dict 返回 None。"""
+    for candidate in (text, text.replace("“", '"').replace("”", '"')):
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def _find_value_after(text, needle):
+    """在 text 中定位 needle（文件名），返回其后「: 值」里的目录值；找不到返回 None。"""
+    idx = text.find(needle)
+    if idx == -1:
+        return None
+    colon = text.find(":", idx + len(needle))
+    if colon == -1:
+        return None
+    p = colon + 1
+    while p < len(text) and text[p] in " \t\r\n":
+        p += 1
+    if p < len(text) and text[p] in ('"', "'"):
+        quote = text[p]
+        end = text.find(quote, p + 1)
+        if end == -1:
+            return None  # 值被截断，无闭合引号，丢弃
+        return text[p + 1:end].strip()
+    # 无引号值：读到逗号 / 换行 / 右花括号为止
+    end = p
+    while end < len(text) and text[end] not in ",\n\r}":
+        end += 1
+    return text[p:end].strip()
+
+
+def _filename_variants(fname):
+    """生成文件名常见的转义变体，用于在模型输出里兜底匹配（模型可能做了转义）。"""
+    variants = []
+    if '"' in fname:
+        variants.append(fname.replace('"', '\\"'))
+    if '\\' in fname:
+        variants.append(fname.replace('\\', '\\\\'))
+    return [v for v in variants if v != fname]
+
+
+def _extract_by_anchor(texts, filenames):
+    """回退解析：按已知文件名在原文里逐条定位并读取目录值。
+
+    不依赖整段 JSON 合法，因此能容忍文件名里未转义的引号/反斜杠、
+    单引号分隔、尾逗号/缺逗号、输出被截断等异常；模型漏掉的条目直接不收录。
+    """
+    mapping = {}
+    for fname in filenames:
+        value = None
+        for text in texts:
+            value = _find_value_after(text, fname)
+            if value is None:
+                for variant in _filename_variants(fname):
+                    value = _find_value_after(text, variant)
+                    if value is not None:
+                        break
+            if value is not None:
+                break
+        if value:
+            mapping[fname] = value
+    return mapping
+
+
+def parse_json_response(text, filenames=None):
+    """从模型输出里提取「文件名 -> 目录」映射，容错处理常见模型异常。
+
+    有已知文件名时优先按锚点逐条提取（键一定与真实文件名一致，避免反斜杠
+    等被 JSON 转义改坏），再用标准 JSON 解析结果补齐漏项；没有文件名清单时
+    退回纯 JSON 解析。filenames 为本次请求已知的文件名清单。
+    """
+    raw = text.strip()
+    # 去除可能的 markdown 代码块包裹
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    # 若周边有多余文字，截取第一个 { 到最后一个 }
+    start = raw.find("{")
+    end = raw.rfind("}")
     if start != -1 and end != -1 and end > start:
-        text = text[start:end + 1]
-    # 模型常输出全角标点（尤其中文提示词下），先归一化再解析
-    text = text.replace("：", ":").replace("，", ",")
-    # 修复模型把扩展名放到引号外的情况：{"名字".mp4:"目录"} -> {"名字.mp4":"目录"}
-    text = re.sub(r'("[^"]*")\.([A-Za-z0-9]{1,8})(\s*:)', lambda m: m.group(1)[:-1] + "." + m.group(2) + '"' + m.group(3), text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # 兜底：把全角引号当半角引号再试一次（可能改变字符串内容，仅作最后手段）
-        return json.loads(text.replace("“", '"').replace("”", '"'))
+        raw = raw[start:end + 1]
+
+    # 归一化全角冒号/逗号（不影响文件名里的全角引号），修复扩展名跑到引号外的情况
+    normalized = raw.replace("：", ":").replace("，", ",")
+    normalized = re.sub(
+        r'("[^"]*")\.([A-Za-z0-9]{1,8})(\s*:)',
+        lambda m: m.group(1)[:-1] + "." + m.group(2) + '"' + m.group(3),
+        normalized,
+    )
+
+    parsed = _try_strict_json(normalized)
+
+    if filenames:
+        mapping = _extract_by_anchor([normalized, raw], filenames)
+        # 用严格解析结果补齐锚点没定位到的文件（例如模型改写了文件名的情况）
+        if parsed is not None:
+            for fname in filenames:
+                if fname not in mapping:
+                    v = resolve_category(parsed, fname)
+                    if v:
+                        mapping[fname] = v
+        if mapping:
+            return mapping
+
+    if parsed is not None:
+        return parsed
+
+    raise json.JSONDecodeError("无法从模型输出解析出有效映射", text, 0)
 
 
 def resolve_category(mapping, fname):
@@ -326,7 +419,7 @@ def main():
             try:
                 content = call_deepseek(user_prompt)
                 last_raw = content
-                mapping = parse_json_response(content)
+                mapping = parse_json_response(content, batch)
                 break
             except (urllib.error.URLError, json.JSONDecodeError, KeyError, IndexError) as e:
                 last_err = e
