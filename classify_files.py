@@ -40,11 +40,42 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import subprocess
 
 try:
     import certifi
 except ImportError:
     certifi = None
+
+
+def load_system_env(profile_path="~/.bashrc"):
+    """执行 Bash 并导出所有环境变量，然后注入到 Python 的 os.environ 中"""
+    # 展开 ~ 符号为实际的绝对路径
+    expanded_path = os.path.expanduser(profile_path)
+
+    # 构造命令：在 Bash 中 source 目标文件后，执行 env 命令输出所有变量
+    command = f"source {expanded_path} && env"
+
+    try:
+        # 使用 executable="/bin/bash" 确保可以使用 source 命令
+        result = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, shell=True, executable="/bin/bash"
+        )
+
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    # 将系统环境变量注入到当前 Python 进程中
+                    os.environ[key] = value
+        else:
+            print(f"加载环境失败: {result.stderr}")
+    except Exception as e:
+        print(f"发生错误: {e}")
+
+load_system_env("~/.bashrc")  # 加载当前用户环境
+load_system_env("/etc/profile")  # 加载系统全局环境
 
 # python.org 版 Python 自带 cert.pem 缺失，urllib 会报 CERTIFICATE_VERIFY_FAILED；
 # 用 certifi 的 CA bundle 建 SSL 上下文来规避。
